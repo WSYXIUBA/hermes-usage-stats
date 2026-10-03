@@ -4,32 +4,46 @@
 
 ## 功能（样式对标 Z.ai 使用统计页）
 
-- **五格汇总卡**：累计 Token 数（全库口径，含子代理与压缩续接）、峰值 Token 数、最长聊天时长、当前连续天数、最长连续天数
+- **五格汇总卡**：累计 Token 数（全库口径）、峰值 Token 数、最长聊天时长、当前连续天数、最长连续天数
 - **Token 活动热力图**：GitHub 风格 53 周格子，每日 / 每周 / 累计三种聚合
 - **每日 Token 趋势图**：近 7 / 30 / 90 日，Top3 模型分色平滑折线 + 总量虚线
 - **模型用量环图**：Top5 模型占比 + 图例
 
 ## 数据口径（对齐 API 平台统计）
 
-**Token 总数 = 输入 + 输出 + 缓存读取**。API 平台报的「输入」本身包含缓存读取（如输入 486.5M 其中缓存读取 467.47M），对应 Hermes 会话库 `input_tokens + cache_read_tokens + output_tokens` 三列相加。官方 analytics 页只加 input+output，数字会小一个量级，不要拿它对表。
+**Token 总数 = 输入 + 输出 + 缓存读取**。API 平台报的「输入」本身包含缓存读取，对应会话库 `input_tokens + cache_read_tokens + output_tokens` 三列相加。官方 analytics 页只加 input+output，数字会小一个量级，不要拿它对表。
 
 | 数据 | 来源 | 说明 |
 |---|---|---|
-| 累计 Token 数 / 模型占比（全库） | `GET /api/analytics/usage?days=365` | 全行聚合（含子代理、压缩续接行），最完整 |
-| 热力图 / 趋势 / 连续天数 / 范围内模型环 | `GET /api/sessions` 全量深分页遍历 | 按本地自然日（0 点日界）重叠时长加权分摊，跨午夜会话按小时切分 |
-| 压缩链补齐 | `GET /api/sessions/{id}`（经 `_lineage_ids`） | 续接行的 tokens 归到各自开始日期 |
+| 每日×模型 / 模型环 / 趋势 / 热力图 / 累计 | 自带 Python 后端（`plugin_api.py`） | 直读 state.db 的 `session_model_usage` 表 |
+| 最长聊天时长 / 连续天数 / 会话数 | `GET /api/sessions` 全量深分页遍历 | 会话级元数据 |
 
-通道：`window.hermesDesktop.api`（渲染层 preload 桥）。结果缓存在 `ctx.storage`，进页面先出缓存再后台刷新。
+### v1.5 归因口径（session_model_usage）
+
+Hermes 每次真实 API 调用都把该次的 tokens 记在**调用时刻实际使用的模型**名下（官方 #51607 为解决会话中途切模型归因错误而建）。因此：
+
+- 会话中切换多个模型时，各模型的消耗各归各家，不会全部记到最后使用的模型
+- 每条记录带 `first_seen`/`last_seen`（真实调用时间窗），跨午夜的记录按本地自然日重叠时长切分——当日 00:00–23:59 的边界是精确的
+- 只统计主循环调用（`task = ''`）；压缩 / 后台审查等辅助调用的模型各自独立计费，不在对话用量里
 
 ## 安装 / 更新
 
+插件是「桌面 UI + Python 后端」一体包，首次安装需要两步：
+
 ```bash
+# 1) 桌面 UI
 cp plugin.js "$LOCALAPPDATA/hermes/desktop-plugins/usage-stats/plugin.js"
+# 2) Python 后端（需在 config.yaml 的 plugins.enabled 里加 usage-stats）
+mkdir -p "$LOCALAPPDATA/hermes/plugins/usage-stats/dashboard"
+cp plugin_api.py "$LOCALAPPDATA/hermes/plugins/usage-stats/dashboard/plugin_api.py"
+cp manifest.json "$LOCALAPPDATA/hermes/plugins/usage-stats/dashboard/manifest.json"
 ```
 
 然后在 Hermes 里 `Ctrl+K` → 「重载桌面插件」。入口：侧栏「使用统计」、路由 `/usage-stats`、命令面板「打开使用统计」。
 
+Python 后端由 `hermes serve`（桌面后端）在启动时挂载到 `/api/plugins/usage-stats/*`，只读打开 state.db。改动 `plugins.enabled` 或首次安装后端后需要重启 Hermes（或后端进程）才会生效。
+
 ## 已知口径限制
 
-- 遍历端点不返回委托子代理（delegate）行，其用量只计入「累计」（analytics 口径），不进图表
-- 跨天会话按活动区间均摊，不是逐消息精确归属（需要逐消息数据得另走 messages 接口，代价大）
+- 悬浮明细里的「输入/输出」两行按全库比例从总量还原（`session_model_usage` 的每日聚合只取总量），总量与模型归因不受影响
+- 8月17日之前的历史会话无逐模型记录（表建立前的数据），那部分用量不计入图表

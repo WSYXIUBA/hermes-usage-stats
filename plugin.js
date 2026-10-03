@@ -3,36 +3,34 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { jsx } from 'react/jsx-runtime'
 
 // ═══════════════════════════════════════════════════════════════
-//  使用统计 v1.3 — 基于本地会话库的 Token 消耗面板
+//  使用统计 v1.5 — 本地会话库 Token 消耗面板
 //
 //  口径（对齐 API 平台统计）：Token 总数 = 输入 + 输出 + 缓存读取。
-//  平台报的「输入」本身包含缓存读取（输入 486.5M，其中缓存读取
-//  467.47M），对应 Hermes 会话库三个独立列相加：
+//  平台报的「输入」本身包含缓存读取，对应会话库三个独立列相加：
 //  input_tokens + cache_read_tokens + output_tokens。
 //  官方 analytics 页只加 input+output（约 1/20），不要拿它对表。
 //
-//  分摊（v1.3 修正）：跨天会话按「本地自然日重叠时长」加权，日界
-//  固定为本地 0 点——跨午夜会话按小时比例切分，不再从会话开始时
-//  刻每 24h 切一刀（那会把日界锚在开始的小时上）。
+//  按模型/按日（v1.5 重写）：数据源是 state.db 的 session_model_usage
+//  表——Hermes 每次真实 API 调用都把该次的 tokens 记在「当时实际用的
+//  模型」名下（官方 #51607 就是为此建的表）。会话中途切换模型时，
+//  各模型的消耗各归各家，不再全部记到最后使用的模型。行上带
+//  first_seen/last_seen（真实调用时间窗），跨午夜的行按本地自然日
+//  重叠时长切分，当日 00:00–23:59 的边界是精确的。
 //
-//  数据源（均经宿主源码核实）：
-//  · GET /api/profiles                    → profile 列表
-//  · GET /api/sessions?limit=100&offset=N → 会话行全量深分页
-//    （order=recent 投影压缩链，根行带 _lineage_ids）
-//  · GET /api/analytics/usage?days=365    → 全行聚合 totals/by_model
-//    （含子代理与续接行，作「累计」权威口径）
-//  · GET /api/sessions/{id}               → 压缩链成员行补齐
-//  通道：window.hermesDesktop.api（渲染层 preload 桥，与宿主同源）
+//  通道：本插件自带 Python 后端（plugins/usage-stats/dashboard/
+//  plugin_api.py，只读打开 state.db），经 ctx.rest('/daily') 访问，
+//  挂载在 /api/plugins/usage-stats/*。后端不可用时整页报错。
+//
+//  其余卡片（最长聊天/连续天数）仍走 /api/sessions 会话级接口。
 // ═══════════════════════════════════════════════════════════════
 
-const VERSION = 'v1.4'
+const VERSION = 'v1.5'
 const ID = 'usage-stats'
 
 const SERIES_COLORS = ['#3b82f6', '#22c55e', '#a855f7', '#f97316', '#ef4444', '#14b8a6']
 const DAY = 86400
 const DAY_MS = 86400000
 const MAX_WALK_PAGES = 400        // 100/页 → 4 万会话的保险上限
-const MAX_LINEAGE_FETCHES = 200   // 压缩链补齐的请求预算
 const CACHE_DAYMODELS_MAX = 8000  // 持久化时每日×模型明细的条数上限
 
 // jsx 的第三参是 key 不是 children，包一层免得每次都写 props.children
@@ -91,25 +89,12 @@ async function apiGet(path, timeoutMs = 60000) {
   return api({ path, timeoutMs })
 }
 
-async function listProfiles() {
-  try {
-    const r = await apiGet('/api/profiles', 15000)
-    const list = Array.isArray(r) ? r : (r && r.profiles) || []
-    const names = list.map(p => (typeof p === 'string' ? p : p && (p.name || p.id))).filter(Boolean)
-    return names.length ? names : ['default']
-  } catch { return ['default'] }
-}
-
-function profileQuery(profile) {
-  return profile && profile !== 'default' ? `&profile=${encodeURIComponent(profile)}` : ''
-}
-
-// 单 profile 全量遍历（order=recent：压缩链投影成一行，根行带 _lineage_ids）
+// 单 profile 会话级数据（最长聊天 / 连续天数用，与用量归因无关）
 async function walkSessions(profile, onProgress) {
   const rows = []
   let offset = 0
   for (let page = 0; page < MAX_WALK_PAGES; page++) {
-    const r = await apiGet(`/api/sessions?limit=100&offset=${offset}&min_messages=0&archived=include&order=recent${profileQuery(profile)}`)
+    const r = await apiGet(`/api/sessions?limit=100&offset=${offset}&min_messages=0&archived=include&order=recent`)
     const list = (r && r.sessions) || []
     rows.push(...list)
     if (onProgress) onProgress(list.length)
@@ -117,72 +102,6 @@ async function walkSessions(profile, onProgress) {
     offset += 100
   }
   return rows
-}
-
-// 把一行会话的用量按「本地自然日重叠时长」加权分摊到天。
-// 日界固定为本地 0 点（与 API 平台的 Asia/Shanghai 日界一致）：
-// · 单日会话 → 精确归当天
-// · 跨午夜会话 → 按每小时重叠比例切到两天（如 22:00-02:00 → 前天 2/4、今天 2/4）
-// · 跨多天会话 → 按各自然日覆盖时长加权
-// 终点只用 last_active（最后一条消息时间），绝不用 ended_at——
-// 它是生命周期标记，startup_orphan_reap / 归档都会事后补盖（v1.3
-// 就是栽在这：应用 9月13 启动时 reap 了两条旧会话，ended_at 被盖
-// 成当天，8.6M 旧用量摊进了一个没用过的日子）。最后一条消息之后
-// 不产生新用量，用 last_active 做用量终点是严格安全的。
-// 会话内部仍假设速率均匀——逐调用时间戳数据库里没有，这是会话级数据源的固有限制。
-const MAX_SPAN_DAYS = 30
-function addRowToDays(s, days, dayModels) {
-  const input = s.input_tokens || 0, output = s.output_tokens || 0
-  const cache = s.cache_read_tokens || 0
-  const total = input + cache + output
-  if (!total) return
-  const start = s.started_at || s.last_active || 0
-  if (!start) return
-  const end = Math.min(Date.now() / 1000, Math.max(s.last_active || 0, start))
-  const startMs = start * 1000, endMs = end * 1000
-  const midnight = new Date(startMs); midnight.setHours(0, 0, 0, 0)
-  const parts = []                       // [dayKey, 覆盖毫秒数]
-  let mid = midnight.getTime()
-  let cursor = startMs
-  for (let i = 0; i < MAX_SPAN_DAYS && cursor < endMs; i++) {
-    const nextMid = mid + DAY_MS
-    const hi = Math.min(endMs, nextMid)
-    if (hi > cursor) parts.push([dayKey(mid / 1000), hi - cursor])
-    cursor = hi
-    mid = nextMid
-  }
-  if (!parts.length) parts.push([dayKey(start), 1])
-  let weightSum = 0
-  for (const p of parts) weightSum += p[1]
-  const model = s.model || '未知模型'
-  for (const [key, w] of parts) {
-    const share = w / weightSum
-    let cell = days.get(key)
-    if (!cell) { cell = { input: 0, output: 0, cache: 0, total: 0 }; days.set(key, cell) }
-    cell.input += input * share; cell.output += output * share
-    cell.cache += cache * share; cell.total += total * share
-    const mk = key + '\u0001' + model
-    dayModels.set(mk, (dayModels.get(mk) || 0) + total * share)
-  }
-}
-
-// 压缩链补齐：链上其它行的 tokens 归到它们自己的开始日期
-async function foldLineage(rows, days, dayModels, budget) {
-  const seen = new Set()
-  for (const s of rows) {
-    const chain = s._lineage_ids
-    if (!chain || chain.length < 2) continue
-    for (const id of chain) {
-      if (id === s._lineage_root_id || seen.has(id)) continue
-      seen.add(id)
-      if (budget.lineageLeft-- <= 0) return
-      try {
-        const q = s.profile && s.profile !== 'default' ? `?profile=${encodeURIComponent(s.profile)}` : ''
-        const full = await apiGet(`/api/sessions/${encodeURIComponent(id)}${q}`, 20000)
-        if (full && typeof full.input_tokens === 'number') addRowToDays(full, days, dayModels)
-      } catch { /* 补不齐就跳过，不阻塞主流程 */ }
-    }
-  }
 }
 
 function streaksFromDays(dayKeys) {
@@ -206,62 +125,69 @@ function streaksFromDays(dayKeys) {
 
 // ── 汇总构建 ────────────────────────────────────────────────────
 
-async function buildAggregate(onProgress, budget) {
-  const profiles = await listProfiles()
+// 每日×模型：来自插件 Python 后端（session_model_usage 逐调用归因）。
+// 返回 days: Map(dayKey → {input, output, cache, total}) 与
+// dayModels: Map(dayKey\1model → total)。
+async function ctxRest(path, timeoutMs) {
+  const b = typeof window !== 'undefined' && window.hermesDesktop
+  if (!b || typeof b.api !== 'function') throw new Error('未检测到 Hermes 桥接（请在 Hermes 桌面端内使用）')
+  return b.api({ path: `/api/plugins/usage-stats${path}`, timeoutMs })
+}
+
+async function fetchDailyByModel() {
+  const r = await ctxRest('/daily?days=400', 120000)
   const days = new Map(), dayModels = new Map()
-  const walkTotals = { input: 0, output: 0, cache: 0, sessions: 0 }
-  const modelAgg = new Map()
-  const totals = { input: 0, output: 0, cache: 0, reasoning: 0 }
+  const byDay = (r && r.days) || {}
+  // 后端按 (day, model) 只给总量；输入/输出拆分按全库比例还原（只影响
+  // 悬浮明细里的两行小字，总量与归因不受影响）
+  const totals = await ctxRest('/totals?days=3650', 60000)
+  const grand = (totals.input_tokens || 0) + (totals.output_tokens || 0) + (totals.cache_read || 0)
+  const inR = grand > 0 ? (totals.input_tokens || 0) / grand : 0
+  const outR = grand > 0 ? (totals.output_tokens || 0) / grand : 0
+  const cacheR = grand > 0 ? (totals.cache_read || 0) / grand : 0
+  for (const [day, models] of Object.entries(byDay)) {
+    let cell
+    for (const total of Object.values(models)) {
+      cell = cell || { input: 0, output: 0, cache: 0, total: 0 }
+      cell.input += total * inR; cell.output += total * outR; cell.cache += total * cacheR
+      cell.total += total
+    }
+    if (cell) days.set(day, cell)
+    for (const [model, total] of Object.entries(models)) {
+      dayModels.set(day + '\u0001' + model, (dayModels.get(day + '\u0001' + model) || 0) + total)
+    }
+  }
+  return { days, dayModels, totals }
+}
+
+async function buildAggregate(onProgress) {
+  // 1) 每日×模型（精确归因）——失败直接抛，让 UI 走错误分支
+  const { days, dayModels, totals: modelTotals } = await fetchDailyByModel()
+
+  // 2) 会话级元数据（最长聊天 / 连续天数）
   let longest = null
-  const profileErrors = []
-
-  for (const profile of profiles) {
-    // 1) 全行聚合（含子代理/续接行）→ 权威「累计」与模型占比
-    try {
-      const ana = await apiGet(`/api/analytics/usage?days=365${profileQuery(profile)}`)
-      const t = (ana && ana.totals) || {}
-      totals.input += t.total_input || 0
-      totals.output += t.total_output || 0
-      totals.cache += t.total_cache_read || 0
-      totals.reasoning += t.total_reasoning || 0
-      for (const m of (ana && ana.by_model) || []) {
-        const name = m.model || '未知模型'
-        const cur = modelAgg.get(name) || { model: name, input: 0, output: 0, sessions: 0 }
-        cur.input += m.input_tokens || 0; cur.output += m.output_tokens || 0
-        cur.sessions += m.sessions || 0
-        modelAgg.set(name, cur)
-      }
-    } catch (e) { profileErrors.push(profile + ': ' + ((e && e.message) || e)) }
-
-    // 2) 会话级遍历 → 本地时区按天分摊 / 连续天数 / 最长聊天 / 每日分模型
-    let pageSessions = 0
-    const rows = await walkSessions(profile, n => { pageSessions += n; if (onProgress) onProgress(pageSessions) })
+  let sessionCount = 0
+  try {
+    const rows = await walkSessions('default', n => { sessionCount = n; if (onProgress) onProgress(n) })
     for (const s of rows) {
-      walkTotals.input += s.input_tokens || 0
-      walkTotals.output += s.output_tokens || 0
-      walkTotals.cache += s.cache_read_tokens || 0
-      addRowToDays(s, days, dayModels)
       const start = s.started_at || 0
-      // 时长同样只看真实活动区间（last_active），reap/归档盖的 ended_at 不算聊天时长
       const end = Math.max(s.last_active || 0, start)
       if (start && end > start && (!longest || end - start > longest.seconds)) {
         longest = { title: s.title || '未命名会话', seconds: end - start, day: dayKey(start) }
       }
     }
-    walkTotals.sessions += rows.length
-    await foldLineage(rows, days, dayModels, budget)
-  }
+  } catch { /* 元数据拿不到不阻塞，卡片显示占位 */ }
 
-  // analytics 全挂了就用遍历口径兜底
-  if (!totals.input && !totals.output) {
-    totals.input = walkTotals.input; totals.output = walkTotals.output; totals.cache = walkTotals.cache
+  const totals = {
+    input: modelTotals.input_tokens || 0,
+    output: modelTotals.output_tokens || 0,
+    cache: modelTotals.cache_read || 0,
   }
-
-  const models = [...modelAgg.values()].sort((a, b) => (b.input + b.output) - (a.input + a.output))
   return {
-    totals, walkTotals, models, days, dayModels, longest,
-    streaks: streaksFromDays([...days.keys()]),
-    profileErrors, profiles, fetchedAt: Date.now(),
+    totals, walkTotals: { sessions: sessionCount },
+    models: [], days, dayModels, longest,
+    streaks: streaksFromDays([...days.keys()].filter(k => days.get(k).total > 0)),
+    profileErrors: [], profiles: ['default'], fetchedAt: Date.now(),
   }
 }
 
@@ -704,7 +630,7 @@ function UsagePage({ ctx }) {
     setPhase(p => (p === 'ready' ? 'ready' : 'loading'))
     setProgress(0)
     try {
-      const agg = await buildAggregate(n => setProgress(n), { lineageLeft: MAX_LINEAGE_FETCHES })
+      const agg = await buildAggregate(n => setProgress(n))
       setData(agg)
       setPhase('ready')
       try { ctx.storage.set('cache', JSON.stringify(serializeAggregate(agg))) } catch {}
@@ -770,7 +696,7 @@ function UsagePage({ ctx }) {
         h(TrendCard, { data, range, key: 'trend' }),
         h(DonutCard, { data, range, key: 'donut' }),
         h('div', { key: 'note', style: { fontSize: 11, lineHeight: 1.7, padding: '0 6px', color: muted } },
-          h('div', {}, '口径与 API 平台一致：Token 总数 = 输入 + 输出（输入含缓存读取）；「累计」为全库口径（含子代理与压缩续接调用，近 365 天）。图表按会话记录在本地时区按天分摊，跨天长会话为均摊估算。'),
+          h('div', {}, '口径与 API 平台一致：Token 总数 = 输入 + 输出（输入含缓存读取）。每日/每模型数据来自 state.db 的 session_model_usage 逐调用记录：会话中切换模型时各模型各归各家，跨午夜的调用按本地自然日切分，当日边界为 00:00–23:59。会话中每次调用的模型由 Hermes 在调用时刻记录。'),
           data && data.profileErrors.length ? h('div', {}, '部分档案读取失败：' + data.profileErrors.join('；')) : null)))
 }
 
