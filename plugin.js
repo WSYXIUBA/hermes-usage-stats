@@ -475,6 +475,16 @@ function TrendCard({ data, range }) {
       model,
       values: keys.map(k => data.dayModels.get(k + '\u0001' + model) || 0),
     }))
+    // 每天实际用过的模型（>0），tooltip 用——只显示当天真用到的，不列 0
+    const dayByKey = new Map()
+    for (const k of keys) {
+      const prefix = k + '\u0001'
+      const list = []
+      for (const [mk, v] of data.dayModels) {
+        if (mk.startsWith(prefix) && v > 0) list.push([mk.slice(prefix.length), v])
+      }
+      dayByKey.set(k, list)
+    }
     const ymax = Math.max(1, ...totalByDay, ...series.flatMap(s => s.values))
     const x = i => padL + (i * (W - padL - padR)) / Math.max(1, n - 1)
     const y = v => HH - padB - (v / ymax) * (HH - padT - padB)
@@ -482,7 +492,7 @@ function TrendCard({ data, range }) {
     const tickIdx = []
     for (let i = 0; i < n; i += labelEvery) tickIdx.push(i)
     if (tickIdx[tickIdx.length - 1] !== n - 1) tickIdx.push(n - 1)
-    return { keys, series, totalByDay, ymax, x, y, tickIdx }
+    return { keys, series, dayByKey, totalByDay, ymax, x, y, tickIdx }
   }, [data, range])
 
   const onMove = useCallback(e => {
@@ -493,14 +503,21 @@ function TrendCard({ data, range }) {
     const scale = rect.width / W
     let i = Math.round((px / scale - padL) / (plotW / Math.max(1, chart.keys.length - 1)))
     i = Math.max(0, Math.min(chart.keys.length - 1, i))
+    const day = chart.keys[i]
+    // 只列当天真正用过的模型（>0），按用量降序——跨日 top3 线在别的天可能为 0，列出来全是噪音
+    const dayModels = [...chart.dayByKey.get(day) || []].sort((a, b) => b[1] - a[1])
+    const colorOf = model => {
+      const si = chart.series.findIndex(s => s.model === model)
+      return SERIES_COLORS[(si >= 0 ? si : chart.series.length + dayModels.findIndex(([m]) => m === model)) % SERIES_COLORS.length]
+    }
     setTip({
       x: e.clientX, y: rect.top + 6,
       body: [
         h('div', { key: 't', style: { fontWeight: 600, marginBottom: 2 } },
-          fmtDayCN(chart.keys[i]) + (chart.keys[i] === todayKey() ? '（今天）' : '')),
-        ...chart.series.map((s, j) => h('div', { key: 'm' + j, style: { display: 'flex', gap: 8, justifyContent: 'space-between' } },
-          h('span', { key: 'n', style: { color: SERIES_COLORS[j % SERIES_COLORS.length] } }, s.model),
-          h('span', { key: 'v', style: { fontVariantNumeric: 'tabular-nums' } }, fmtTokens(s.values[i])))),
+          fmtDayCN(day) + (day === todayKey() ? '（今天）' : '')),
+        ...dayModels.map(([model, v], j) => h('div', { key: 'm' + j, style: { display: 'flex', gap: 8, justifyContent: 'space-between' } },
+          h('span', { key: 'n', style: { color: colorOf(model) } }, model),
+          h('span', { key: 'v', style: { fontVariantNumeric: 'tabular-nums' } }, fmtTokens(v)))),
         h('div', { key: 'sum', style: { marginTop: 2, borderTop: '1px solid rgba(255,255,255,0.15)', paddingTop: 2, display: 'flex', gap: 8, justifyContent: 'space-between' } },
           h('span', { key: 'n', style: { opacity: 0.8 } }, '合计'),
           h('span', { key: 'v', style: { fontVariantNumeric: 'tabular-nums' } }, fmtTokens(chart.totalByDay[i]))),
