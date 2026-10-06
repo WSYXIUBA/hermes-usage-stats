@@ -195,7 +195,7 @@ async function buildAggregate(onProgress) {
 
 function serializeAggregate(a) {
   return {
-    v: 5, at: a.fetchedAt,
+    v: 6, at: a.fetchedAt,
     totals: a.totals, walkTotals: a.walkTotals,
     models: a.models, longest: a.longest, streaks: a.streaks,
     profiles: a.profiles, profileErrors: a.profileErrors,
@@ -204,7 +204,7 @@ function serializeAggregate(a) {
   }
 }
 function deserializeAggregate(o) {
-  if (!o || o.v !== 5) return null   // 旧口径缓存的分摊算法/口径不同，直接作废
+  if (!o || o.v !== 6) return null   // 旧口径缓存的分摊算法/口径不同，直接作废
   return {
     totals: o.totals || {}, walkTotals: o.walkTotals || { sessions: 0 },
     models: o.models || [], longest: o.longest || null, streaks: o.streaks || { current: 0, best: 0 },
