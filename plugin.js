@@ -713,7 +713,7 @@ function UsagePage({ ctx }) {
         h(TrendCard, { data, range, key: 'trend' }),
         h(DonutCard, { data, range, key: 'donut' }),
         h('div', { key: 'note', style: { fontSize: 11, lineHeight: 1.7, padding: '0 6px', color: muted } },
-          h('div', {}, '口径与 API 平台一致：Token 总数 = 输入 + 输出（输入含缓存读取）。每日/每模型数据来自 state.db 的 session_model_usage 逐调用记录：会话中切换模型时各模型各归各家，跨午夜的调用按本地自然日切分，当日边界为 00:00–23:59。会话中每次调用的模型由 Hermes 在调用时刻记录。'),
+          h('div', {}, '口径与 API 平台一致：Token 总数 = 输入 + 输出（输入含缓存读取）。每日/每模型数据来自 state.db 的 session_model_usage 逐调用记录：会话中切换模型时各模型各归各家（每次调用记在调用时刻实际用的模型名下），跨午夜的记录按会话真实活动分摊到本地自然日（每次调用的开销 ∝ 当时的上下文大小），当日边界为 00:00–23:59，空闲时段不产生用量。'),
           data && data.profileErrors.length ? h('div', {}, '部分档案读取失败：' + data.profileErrors.join('；')) : null)))
 }
 
